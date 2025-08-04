@@ -6,7 +6,7 @@ from PIL import Image
 import os
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from new import SkinLesionSegmentationModel, SkinLesionDataset  # Update as per your structure
+from new import SkinLesionSegmentationModel, SkinLesionDataset  
 
 def calculate_dice_score(pred, target, smooth=1e-5):
     pred = torch.sigmoid(pred)
@@ -84,7 +84,6 @@ def main():
     test_dataset = SkinLesionDataset(
         data_dir='../model/data 2017/test',
         img_size=(256, 256),
-        # augment=False,
     )
 
     test_loader = DataLoader(
