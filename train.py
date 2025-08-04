@@ -25,7 +25,6 @@ class SwinTransformerBlock(nn.Module):
         self.window_size = window_size
         self.shift_size = shift_size
         
-        # If window size is larger than input resolution, we don't partition windows
         if min(self.input_resolution) <= self.window_size:
             self.shift_size = 0
             self.window_size = min(self.input_resolution)
@@ -44,7 +43,6 @@ class SwinTransformerBlock(nn.Module):
         )
         
         if self.shift_size > 0:
-            # Calculate attention mask for SW-MSA
             H, W = self.input_resolution
             img_mask = torch.zeros((1, H, W, 1))
             h_slices = (slice(0, -self.window_size),
@@ -75,51 +73,35 @@ class SwinTransformerBlock(nn.Module):
         
         shortcut = x
         x = self.norm1(x)
-        
-        # Reshape for window attention
         x = x.view(B, H, W, C)
-        
-        # Pad feature maps to multiples of window size
         pad_l = pad_t = 0
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
         x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b))
         _, Hp, Wp, _ = x.shape
-        
-        # Cyclic shift
+
         if self.shift_size > 0:
             shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         else:
             shifted_x = x
             
-        # Partition windows
         x_windows = window_partition(shifted_x, self.window_size)
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
-        
-        # W-MSA/SW-MSA
         attn_windows = self.attn(x_windows, mask=self.attn_mask)
-        
-        # Merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
         shifted_x = window_reverse(attn_windows, self.window_size, Hp, Wp)
         
-        # Reverse cyclic shift
         if self.shift_size > 0:
             x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
             x = shifted_x
             
-        # Remove padding
         if pad_r > 0 or pad_b > 0:
             x = x[:, :H, :W, :].contiguous()
             
         x = x.view(B, H*W, C)
-        
-        # FFN
         x = shortcut + x
         x = x + self.mlp(self.norm2(x))
-        
-        # Reshape back to original format
         x = x.view(B, H, W, C).permute(0, 3, 1, 2)
         return x
 
@@ -183,11 +165,7 @@ class SwinTransformerBottleneck(nn.Module):
         super().__init__()
         self.conv_reduce = nn.Conv2d(in_channels, out_channels, 1)
         self.norm = nn.LayerNorm(out_channels)
-        
-        # Adjust window size if input is too small
         window_size = min(7, min(input_resolution))
-        
-        # Create Swin Transformer blocks with shifted and non-shifted windows
         self.block1 = SwinTransformerBlock(
             dim=out_channels,
             input_resolution=input_resolution,
@@ -208,11 +186,8 @@ class SwinTransformerBottleneck(nn.Module):
     def forward(self, x):
         x = self.conv_reduce(x)
         B, C, H, W = x.shape
-        
-        # Process through Swin Transformer blocks
         x = self.block1(x)
         x = self.block2(x)
-        
         x = self.conv_expand(x)
         return x
 
@@ -225,8 +200,6 @@ class GraphAttentionBlock(nn.Module):
         self.num_nodes = len(channels_list)
         
         self.positional_enc = nn.Parameter(torch.randn(1, self.num_nodes, hidden_dim))
-        
-        # Project each node feature to hidden_dim
         self.node_projections = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(channels, hidden_dim, 3, padding=1),
@@ -235,16 +208,14 @@ class GraphAttentionBlock(nn.Module):
             ) for channels in channels_list
         ])
         
-        # GAT layers
         self.gat_layers = nn.ModuleList([
             GATConv(hidden_dim, hidden_dim//heads, heads=heads, dropout=0.2),
             GATConv(hidden_dim, hidden_dim, heads=1, dropout=0.1)
         ])
-        
-        # Final projections - now properly handling the channel dimensions
+
         self.final_projections = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(hidden_dim + channels, channels, 1),  # Changed from hidden_dim*2
+                nn.Conv2d(hidden_dim + channels, channels, 1), 
                 nn.BatchNorm2d(channels)
             ) for channels in channels_list
         ])
@@ -268,7 +239,7 @@ class GraphAttentionBlock(nn.Module):
         batch_size = skip_connections[0].size(0)
         spatial_sizes = [skip.size()[2:] for skip in skip_connections]
         
-        # Project and add positional encoding
+
         node_features = []
         for proj, skip in zip(self.node_projections, skip_connections):
             x = proj(skip)
@@ -277,7 +248,7 @@ class GraphAttentionBlock(nn.Module):
         
         node_features = torch.stack(node_features, dim=1) + self.positional_enc
         
-        # Graph processing
+      
         x = node_features.view(-1, self.hidden_dim)
         edge_index = self.create_full_adjacency(self.num_nodes)
         edge_index = self.batch_aware_edge_index(edge_index.to(x.device), batch_size, self.num_nodes)
@@ -287,7 +258,7 @@ class GraphAttentionBlock(nn.Module):
             x = F.relu(x)
             x = F.dropout(x, p=0.1, training=self.training)
         
-        # Residual connection
+    
         x = x.view(batch_size, self.num_nodes, self.hidden_dim)
         output_skips = []
         for i, (proj, skip, size) in enumerate(zip(self.final_projections, skip_connections, spatial_sizes)):
@@ -314,19 +285,19 @@ class DecoderBlock(nn.Module):
     def __init__(self, in_channels, out_channels, skip_channels):
         super().__init__()
         
-        # Proper upsampling with channel adjustment
+      
         self.upsample = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            nn.Conv2d(in_channels, skip_channels, kernel_size=1)  # Project to skip_channels
+            nn.Conv2d(in_channels, skip_channels, kernel_size=1)
         )
         
-        # Simplified attention gate
+      
         self.att_gate = nn.Sequential(
             nn.Conv2d(skip_channels, 1, kernel_size=1),
             nn.Sigmoid()
         )
         
-        # Main processing
+        
         self.conv_block = nn.Sequential(
             nn.Conv2d(skip_channels * 2, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
@@ -337,43 +308,30 @@ class DecoderBlock(nn.Module):
         )
 
     def forward(self, x, skip):
-        # Step 1: Upsample with channel projection
+       
         x = self.upsample(x)
         
-        # Step 2: Ensure spatial dimensions match
         if x.shape[2:] != skip.shape[2:]:
             x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=True)
-        
-        # Step 3: Apply attention to skip connection
         att = self.att_gate(skip)
         skip = skip * att
-        
-        # Step 4: Concatenate and process
         x = torch.cat([x, skip], dim=1)
         return self.conv_block(x)
     
 class SkinLesionSegmentationModel(nn.Module):
     def __init__(self, in_channels=3, out_channels=1):
         super().__init__()
-        
-        # Encoder with more channels
-        self.encoder1 = EncoderBlock(in_channels, 96, dilation_rate=1)  # Increased from 64
+      
+        self.encoder1 = EncoderBlock(in_channels, 96, dilation_rate=1) 
         self.encoder2 = EncoderBlock(96, 192, dilation_rate=2)
         self.encoder3 = EncoderBlock(192, 384, dilation_rate=4)
         self.encoder4 = EncoderBlock(384, 768, dilation_rate=8)
-        
-        # Bottleneck with Swin Transformer
         self.swin_bottleneck = SwinTransformerBottleneck(768, 384)
-        
         self.graph_att = GraphAttentionBlock([96, 192, 384, 768])
-        
-        # Decoder with attention
         self.decoder4 = DecoderBlock(384, 768, 768)
         self.decoder3 = DecoderBlock(768, 384, 384)
         self.decoder2 = DecoderBlock(384, 192, 192)
         self.decoder1 = DecoderBlock(192, 96, 96)
-        
-        # Final conv with residual
         self.final_conv = nn.Sequential(
             nn.Conv2d(96, 96, 3, padding=1),
             nn.BatchNorm2d(96),
@@ -382,24 +340,16 @@ class SkinLesionSegmentationModel(nn.Module):
         )
         
     def forward(self, x):
-        # Encoder
-        e1 = self.encoder1(x)  # 256×256×96
-        e2 = self.encoder2(F.max_pool2d(e1, 2))  # 128×128×192
-        e3 = self.encoder3(F.max_pool2d(e2, 2))  # 64×64×384
-        e4 = self.encoder4(F.max_pool2d(e3, 2))  # 32×32×768
-        
-        # Bottleneck with Swin Transformer
-        bottleneck = self.swin_bottleneck(F.max_pool2d(e4, 2))  # 16×16×384
-        
-        # Graph attention
+        e1 = self.encoder1(x) 
+        e2 = self.encoder2(F.max_pool2d(e1, 2))  
+        e3 = self.encoder3(F.max_pool2d(e2, 2))  
+        e4 = self.encoder4(F.max_pool2d(e3, 2)) 
+        bottleneck = self.swin_bottleneck(F.max_pool2d(e4, 2)) 
         e1, e2, e3, e4 = self.graph_att([e1, e2, e3, e4])
-        
-        # Decoder
-        d4 = self.decoder4(bottleneck, e4)  # in_channels=384, skip_channels=768 → out=768
-        d3 = self.decoder3(d4, e3)  # in=768, skip=384 → out=384
-        d2 = self.decoder2(d3, e2)  # in=384, skip=192 → out=192
-        d1 = self.decoder1(d2, e1)  # in=192, skip=96 → out=96
-        
+        d4 = self.decoder4(bottleneck, e4)  
+        d3 = self.decoder3(d4, e3) 
+        d2 = self.decoder2(d3, e2)
+        d1 = self.decoder1(d2, e1) 
         return self.final_conv(d1)
 
 class CombinedLoss(nn.Module):
@@ -416,8 +366,6 @@ class CombinedLoss(nn.Module):
         
     def dice_loss(self, inputs, targets):
         inputs = torch.sigmoid(inputs)
-        
-        # Flatten inputs and targets
         inputs = inputs.view(-1)
         targets = targets.view(-1)
         
@@ -428,8 +376,6 @@ class CombinedLoss(nn.Module):
     
     def focal_loss(self, inputs, targets):
         inputs = torch.sigmoid(inputs)
-        
-        # Flatten inputs and targets
         inputs = inputs.view(-1)
         targets = targets.view(-1)
         
@@ -442,8 +388,6 @@ class CombinedLoss(nn.Module):
         bce = self.bce_loss(inputs, targets)
         dice = self.dice_loss(inputs, targets)
         focal = self.focal_loss(inputs, targets)
-        
-        # total_loss = self.bce_weight * bce + self.dice_weight * dice + self.focal_weight * focal
         total_loss = self.bce_weight * bce 
         
         return total_loss
@@ -464,82 +408,6 @@ class CombinedLoss(nn.Module):
         union = pred.sum() + target.sum() - intersection
         return (intersection + smooth) / (union + smooth)
 
-# class SkinLesionDataset(Dataset):
-#     def __init__(self, data_dir, img_size=(256, 256), augment=False, preprocess=True):
-#         self.image_dir = os.path.join(data_dir, 'images')
-#         self.gt_dir = os.path.join(data_dir, 'gt')
-#         self.image_files = sorted([f for f in os.listdir(self.image_dir) if f.endswith('.jpg')])
-#         self.gt_files = [f.replace('.jpg', '_segmentation.png') for f in self.image_files]
-#         self.img_size = img_size
-#         self.augment = augment
-#         self.preprocess = preprocess
-        
-#         # Enhanced augmentations
-#         self.aug_transform = Compose([
-#             RandomHorizontalFlip(p=0.5),
-#             RandomVerticalFlip(p=0.5),
-#             RandomRotation(degrees=20),
-#             RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
-#             ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15),
-#             RandomPerspective(distortion_scale=0.15, p=0.3),
-#         ]) if augment else None
-        
-#         self.to_tensor = ToTensor()
-
-#     def __len__(self):
-#         return len(self.image_files)
-
-#     def _preprocess_image(self, img):
-#         """Modified preprocessing pipeline"""
-#         img_np = np.array(img)
-        
-#         # 1. More conservative hair removal
-#         gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-#         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))  # Smaller kernel
-#         blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
-#         _, mask = cv2.threshold(blackhat, 15, 255, cv2.THRESH_BINARY)  # Higher threshold
-#         img_np = cv2.inpaint(img_np, mask, inpaintRadius=2, flags=cv2.INPAINT_TELEA)  # Smaller radius
-        
-#         # 2. Milder contrast enhancement
-#         lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
-#         l, a, b = cv2.split(lab)
-#         clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8,8))  # Reduced clip limit
-#         l_clahe = clahe.apply(l)
-#         lab_clahe = cv2.merge((l_clahe, a, b))
-#         img_np = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2RGB)
-        
-#         # 3. Add gamma correction
-#         gamma = 0.8
-#         invGamma = 1.0 / gamma
-#         table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
-#         img_np = cv2.LUT(img_np, table)
-        
-#         return Image.fromarray(img_np)
-
-#     def __getitem__(self, idx):
-#         img_path = os.path.join(self.image_dir, self.image_files[idx])
-#         gt_path = os.path.join(self.gt_dir, self.gt_files[idx])
-        
-#         img = Image.open(img_path).convert('RGB')
-#         gt = Image.open(gt_path).convert('L')
-        
-#         # Apply preprocessing if enabled
-#         if self.preprocess:
-#             img = self._preprocess_image(img)
-        
-#         # Resize with appropriate interpolation
-#         img = img.resize(self.img_size, Image.BICUBIC)
-#         gt = gt.resize(self.img_size, Image.NEAREST)
-        
-#         # Synchronized augmentations
-#         if self.augment:
-#             seed = torch.randint(0, 2**32, (1,)).item()
-#             torch.manual_seed(seed)
-#             img = self.aug_transform(img)
-#             torch.manual_seed(seed)
-#             gt = self.aug_transform(gt)
-        
-#         return self.to_tensor(img), self.to_tensor(gt)
 
 class SkinLesionDataset(Dataset):
     def __init__(self, data_dir, img_size=(256, 256), augment=False, preprocess=True):
@@ -551,7 +419,6 @@ class SkinLesionDataset(Dataset):
         self.augment = augment
         self.preprocess = preprocess
         
-        # Enhanced augmentations
         self.aug_transform = Compose([
             RandomHorizontalFlip(p=0.5),
             RandomVerticalFlip(p=0.5),
@@ -596,7 +463,7 @@ class SkinLesionDataset(Dataset):
         img = Image.open(img_path).convert('RGB')
         gt = Image.open(gt_path).convert('L')
         
-        # Extract filename without extension (for saving)
+
         filename = os.path.splitext(self.image_files[idx])[0]
         
         if self.preprocess:
@@ -628,12 +495,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch, total_ep
         images, gts = images.to(device), gts.to(device)
         
         optimizer.zero_grad()
-        # outputs, aux_outputs = model(images)
-        
-        # loss_main = criterion(outputs, gts)
-        # loss_aux = criterion(aux_outputs, gts)
-        # loss = loss_main + 0.5 * loss_aux
-        outputs = model(images)  # Not outputs, aux_outputs
+        outputs = model(images)
         loss = criterion(outputs, gts)
         
         loss.backward()
@@ -671,13 +533,8 @@ def validate_epoch(model, dataloader, criterion, device, epoch, total_epochs):
         for images, gts in progress_bar:
             images, gts = images.to(device), gts.to(device)
             
-            # outputs, aux_outputs = model(images)
             
-            # loss_main = criterion(outputs, gts)
-            # loss_aux = criterion(aux_outputs, gts)
-            # loss = loss_main + 0.5 * loss_aux
-            
-            outputs = model(images)  # Not outputs, aux_outputs
+            outputs = model(images)  
             loss = criterion(outputs, gts)
         
             dice_score = criterion.calculate_dice_score(outputs, gts)
@@ -744,8 +601,7 @@ def main():
     epochs = 200
     warmup_epochs = 5
     dataset_type = 'ISIC2017'
-    
-    # Loss function weights can be adjusted based on dataset
+
     if dataset_type == 'ISIC2018':
         bce_weight, dice_weight, focal_weight = 1.0, 0.8, 0.6
     elif dataset_type == 'REFUGE':
@@ -815,7 +671,6 @@ def main():
         
         scheduler.step()
         
-        # Early stopping check
         early_stopping(val_loss, model)
         if early_stopping.early_stop:
             print("Early stopping triggered")
